@@ -1,0 +1,390 @@
+#!/bin/bash
+set -o pipefail
+
+# Amy low is the model bundled by ASL3's asl3-tts package.
+VOICE="/var/lib/piper-tts/en_US-amy-low.onnx"
+RAMDIR="/var/lib/asterisk/sounds/ramdisk"
+RAMDISK_SIZE="32M"
+FSTAB="/etc/fstab"
+INSTALL_PATH="/usr/local/bin/node-speak"
+UNIT_PATH="/etc/systemd/system/node-speak.service"
+RUNDIR="/run/node-speak"
+QUEUE_LIMIT=64
+MAX_TEXT_BYTES=16384
+JOB_TIMEOUT=600
+# Hold audio through short telemetry delays before processing the next job.
+PLAYBACK_GRACE=30
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+require_commands() {
+    local cmd
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || fail "Missing required binary: $cmd"
+    done
+}
+verify_ramdisk() {
+    local filesystem
+    filesystem=$(findmnt -rn -M "$RAMDIR" -o FSTYPE) || fail "$RAMDIR is not a mountpoint; run '$0 --setup' as root."
+    [[ "$filesystem" == tmpfs ]] || fail "$RAMDIR must be mounted as tmpfs (found: $filesystem)."
+}
+
+if [[ "${1:-}" == --setup ]]; then
+    [[ $# -eq 1 ]] || fail "Usage: $0 --setup"
+    [[ $EUID -eq 0 ]] || fail "Setup mode must be run as root."
+    require_commands dpkg-query
+    if [[ "$(dpkg-query -W -f='${Status}' asl3-tts 2>/dev/null)" != 'install ok installed' ]]; then
+        require_commands apt-get
+        printf 'Installing missing ASL3 text-to-speech package: asl3-tts...\n'
+        apt-get update || fail "Cannot refresh package lists. Check network access and the configured ASL3 repository."
+        apt-get install -y asl3-tts || fail "Cannot install asl3-tts. Check the configured ASL3 repository."
+        hash -r
+        [[ "$(dpkg-query -W -f='${Status}' asl3-tts 2>/dev/null)" == 'install ok installed' ]] || fail "asl3-tts installation did not complete."
+    fi
+    # Check actual assets as well as package status before changing mounts/services.
+    require_commands mkdir mount findmnt id chown chmod python3 install mktemp systemctl dirname rm piper sox asterisk
+    [[ -r "$VOICE" && -r "${VOICE}.json" ]] || fail "Voice model or metadata unreadable at $VOICE. Check VOICE or reinstall asl3-tts."
+    SCRIPT_PATH=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0") || fail "Cannot locate this script."
+    OWNER_UID=0
+    OWNER_GID=0
+    WORKER_USER=root
+    if id asterisk >/dev/null 2>&1; then
+        WORKER_USER=asterisk
+        OWNER_UID=$(id -u asterisk) || fail "Cannot determine Asterisk UID."
+        OWNER_GID=$(id -g asterisk) || fail "Cannot determine Asterisk GID."
+    fi
+    OPTIONS="defaults,noatime,mode=0775,size=$RAMDISK_SIZE,uid=$OWNER_UID,gid=$OWNER_GID"
+    mkdir -p "$RAMDIR" || fail "Cannot create $RAMDIR."
+    if ! findmnt -rn -M "$RAMDIR" >/dev/null; then
+        mount -t tmpfs -o "$OPTIONS" tmpfs "$RAMDIR" || fail "Cannot mount tmpfs at $RAMDIR."
+    fi
+    verify_ramdisk
+    chown "$OWNER_UID:$OWNER_GID" "$RAMDIR" || fail "Cannot set ramdisk ownership."
+    chmod 0775 "$RAMDIR" || fail "Cannot set ramdisk permissions."
+
+    # Match the mount directory field exactly, replacing the previous entry.
+    # Keep a backup and atomically replace fstab while retaining its permissions.
+    python3 - "$FSTAB" "$RAMDIR" "$OPTIONS" <<'PY' || fail "Cannot persist ramdisk mount in $FSTAB."
+import os, shutil, sys, tempfile
+path, target, options = sys.argv[1:]
+with open(path) as source:
+    lines = source.readlines()
+entry = f"tmpfs\t{target}\ttmpfs\t{options}\t0\t0\n"
+result = []
+found = False
+for line in lines:
+    fields = line.split()
+    if fields and not fields[0].startswith('#') and len(fields) > 1 and fields[1] == target:
+        if len(fields) < 3 or fields[2] != 'tmpfs':
+            raise SystemExit(f"Refusing to replace a non-tmpfs entry for {target}")
+        if not found:
+            result.append(entry)
+            found = True
+    else:
+        result.append(line)
+if not found:
+    if result and not result[-1].endswith('\n'):
+        result[-1] += '\n'
+    result.append(entry)
+content = ''.join(result)
+if content != ''.join(lines):
+    metadata = os.stat(path)
+    shutil.copy2(path, path + '.node-speak.bak')
+    fd, temporary = tempfile.mkstemp(prefix='.node-speak-fstab-', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w') as destination:
+            destination.write(content)
+            destination.flush()
+            os.fchmod(destination.fileno(), metadata.st_mode & 0o7777)
+            os.fchown(destination.fileno(), metadata.st_uid, metadata.st_gid)
+            os.fsync(destination.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+PY
+    # Install a root-owned copy so a service never depends on a user's home path.
+    mkdir -p "$(dirname "$INSTALL_PATH")" "$(dirname "$UNIT_PATH")" || fail "Cannot create installation directories."
+    if [[ "$SCRIPT_PATH" != "$INSTALL_PATH" ]]; then
+        install -o root -g root -m 0755 "$SCRIPT_PATH" "$INSTALL_PATH" || fail "Cannot install $INSTALL_PATH."
+    else
+        chown root:root "$INSTALL_PATH" && chmod 0755 "$INSTALL_PATH" || fail "Cannot secure installed script."
+    fi
+    UNIT_TEMP=$(mktemp) || fail "Cannot create temporary service definition."
+    if ! python3 - "$INSTALL_PATH" "$RAMDIR" "$WORKER_USER" "$OWNER_GID" <<'PYUNIT' > "$UNIT_TEMP"
+import sys
+script, ramdir, user, group = sys.argv[1:]
+def quote(value):
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+print(f"""[Unit]
+Description=Ordered Piper speech queue for AllStarLink
+Wants=asterisk.service
+After=asterisk.service
+RequiresMountsFor={quote(ramdir)}
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart={quote(script)} --worker
+RuntimeDirectory=node-speak
+RuntimeDirectoryMode=0770
+RuntimeDirectoryPreserve=restart
+UMask=0007
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+""")
+PYUNIT
+    then
+        rm -f -- "$UNIT_TEMP"
+        fail "Cannot generate service definition."
+    fi
+    if ! install -o root -g root -m 0644 "$UNIT_TEMP" "$UNIT_PATH"; then
+        rm -f -- "$UNIT_TEMP"
+        fail "Cannot install service definition."
+    fi
+    rm -f -- "$UNIT_TEMP"
+    systemctl daemon-reload || fail "Cannot reload systemd."
+    systemctl enable node-speak.service || fail "Cannot enable worker."
+    systemctl restart node-speak.service || fail "Cannot start worker."
+    printf 'Setup complete. Submit with: %s <node> "text"\n' "$INSTALL_PATH"
+    exit 0
+fi
+
+# Python's standard library provides a RAM-only queue and short admission locks.
+# No user service manager, sudo rule, socket daemon, or third-party module is needed.
+if [[ "${1:-}" != --play ]]; then
+    require_commands python3
+    if [[ "${1:-}" == --worker ]]; then
+        [[ $# -eq 1 ]] || fail "Usage: $0 --worker"
+        require_commands piper sox asterisk findmnt mktemp chmod rm sleep wc
+        verify_ramdisk
+        [[ -w "$RAMDIR" && -r "$VOICE" && -r "${VOICE}.json" ]] || fail "Worker cannot access ramdisk or voice model."
+    else
+        [[ $# -eq 2 && -n "$2" && "$1" =~ ^[0-9]+$ ]] || fail "Usage: $0 <node_number> \"text to speak\"; or $0 --setup"
+    fi
+    python3 - "$0" "$RUNDIR" "$QUEUE_LIMIT" "$MAX_TEXT_BYTES" "$JOB_TIMEOUT" "$@" <<'PYQUEUE'
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+script, runtime, limit, text_limit, job_timeout, *args = sys.argv[1:]
+script = os.path.realpath(script)
+runtime = Path(runtime)
+limit, text_limit, job_timeout = map(int, (limit, text_limit, job_timeout))
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def validate(node, text):
+    if not isinstance(node, str) or not re.fullmatch(r'[0-9]+', node) or len(node) > 32:
+        raise ValueError('Node must contain 1 to 32 digits')
+    if not isinstance(text, str) or not text or '\0' in text or len(text.encode('utf-8')) > text_limit:
+        raise ValueError(f'Text must contain 1 to {text_limit} UTF-8 bytes and no NUL characters')
+
+
+def open_lock(name):
+    path = runtime / name
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o660)
+    except FileExistsError:
+        fd = os.open(path, flags)
+    else:
+        # Root-created admission files must still be writable by Asterisk.
+        os.fchown(fd, -1, runtime.stat().st_gid)
+        os.fchmod(fd, 0o660)
+    return os.fdopen(fd, 'r+')
+
+
+def ready_jobs():
+    return sorted(runtime.glob('job-*.json'))
+
+
+def job_label(path):
+    # Filenames contain a private ordering prefix and a public UUID.
+    return f"job-{path.stem.split('-', 2)[2]}"
+
+
+def publish(path, content):
+    fd, temporary = tempfile.mkstemp(prefix='.publish-', dir=runtime)
+    try:
+        with os.fdopen(fd, 'w') as output:
+            os.fchown(output.fileno(), -1, runtime.stat().st_gid)
+            os.fchmod(output.fileno(), 0o660)
+            output.write(content)
+        # Atomic publication without overwriting even in the event of a UUID collision.
+        os.link(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def worker():
+    if not runtime.is_dir():
+        raise ValueError('Runtime directory missing; start node-speak.service')
+    with open_lock('worker.lock') as lifetime:
+        try:
+            fcntl.flock(lifetime, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Another queue worker is already running')
+        # Interrupted jobs are not replayed: they might already have transmitted.
+        for abandoned in runtime.glob('job-*.running'):
+            log(f'Discarding interrupted job {job_label(abandoned)}; transmission status unknown')
+            abandoned.unlink()
+        log('Queue worker ready')
+        while True:
+            jobs = ready_jobs()
+            if not jobs:
+                time.sleep(0.2)
+                continue
+            pending = jobs[0]
+            label = job_label(pending)
+            running = pending.with_suffix('.running')
+            os.replace(pending, running)
+            try:
+                with running.open() as source:
+                    request = json.load(source)
+                node, text = request['node'], request['text']
+                validate(node, text)
+                log(f'Starting {label} for node {node}')
+                with subprocess.Popen(['/bin/bash', script, '--play', node, text],
+                                      start_new_session=True) as process:
+                    try:
+                        status = process.wait(timeout=job_timeout)
+                    except subprocess.TimeoutExpired:
+                        log(f'{label} exceeded {job_timeout}s; terminating job')
+                        os.killpg(process.pid, signal.SIGTERM)
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait()
+                        status = 124
+                log(f'Finished {label}: exit={status}')
+            except (ValueError, KeyError, OSError) as error:
+                log(f'Failed {label}: {error}')
+            finally:
+                running.unlink(missing_ok=True)
+
+
+def submit(node, text):
+    validate(node, text)
+    if not runtime.is_dir():
+        raise ValueError('Queue not installed/running; run node-speak --setup as root')
+    with open_lock('worker.lock') as lifetime:
+        try:
+            fcntl.flock(lifetime, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass  # The worker holds an exclusive lifetime lock.
+        else:
+            raise ValueError('Queue worker is not running; start node-speak.service as root')
+    with open_lock('submit.lock') as admission:
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError('Queue admission is busy; try again')
+                time.sleep(0.01)
+        waiting = ready_jobs()
+        if len(waiting) >= limit:
+            raise ValueError(f'Queue is full ({limit} waiting jobs)')
+        # Monotonic time orders admissions across processes without a counter file.
+        # Clamp to waiting jobs to handle equal clock ticks.
+        newest = max((int(path.name.split('-')[1]) for path in waiting), default=0)
+        order = max(time.monotonic_ns(), newest + 1)
+        while True:
+            identifier = uuid.uuid4()
+            name = f'job-{order:020d}-{identifier}.json'
+            try:
+                publish(runtime / name, json.dumps({'node': node, 'text': text}))
+                break
+            except FileExistsError:
+                continue
+    log(f'Queued job-{identifier} for node {node}')
+
+
+try:
+    if args == ['--worker']:
+        worker()
+    else:
+        submit(*args)
+except (OSError, ValueError) as error:
+    print(f'Error: {error}', file=sys.stderr)
+    sys.exit(1)
+PYQUEUE
+    exit $?
+fi
+
+# Internal blocking playback mode; only the queue worker normally invokes this.
+[[ $# -eq 3 && -n "$3" && "$2" =~ ^[0-9]+$ ]] || fail "Invalid worker playback arguments."
+NODE="$2"
+TEXT="$3"
+require_commands piper sox asterisk findmnt mktemp chmod rm sleep wc python3
+[[ -r "$VOICE" && -r "${VOICE}.json" ]] || fail "Piper model or JSON metadata unreadable at $VOICE."
+verify_ramdisk
+[[ -w "$RAMDIR" ]] || fail "Ramdisk directory is not writable."
+
+SAMPLE_RATE=$(python3 - "${VOICE}.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    rate = json.load(source)['audio']['sample_rate']
+if type(rate) is not int or rate <= 0:
+    raise SystemExit('Model audio.sample_rate must be a positive integer')
+print(rate)
+PY
+) || fail "Cannot read sample rate from model metadata."
+asterisk -rx "core show version" >/dev/null 2>&1 || fail "Cannot connect to Asterisk CLI."
+
+# A single queue worker serializes rendering, playback submission, and retention.
+umask 007
+WORKDIR=$(mktemp -d "$RAMDIR/tts_${NODE}_XXXXXXXX") || fail "Cannot create temporary audio directory."
+cleanup() { rm -rf -- "$WORKDIR"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+chmod 0755 "$WORKDIR" || fail "Cannot make audio directory readable by Asterisk."
+TARGET_BASE="$WORKDIR/speech"
+TARGET_FILE="$TARGET_BASE.ulaw"
+
+if ! printf '%s\n' "$TEXT" | piper --model "$VOICE" --output_raw | \
+    sox -v 0.95 -t raw -r "$SAMPLE_RATE" -e signed-integer -b 16 -c 1 - \
+        -t raw -r 8000 -c 1 -e u-law "$TARGET_FILE"; then
+    fail "TTS rendering failed."
+fi
+[[ -s "$TARGET_FILE" ]] || fail "TTS rendering generated empty audio."
+chmod 0644 "$TARGET_FILE" || fail "Cannot make audio readable by Asterisk."
+
+# Asterisk may print a CLI rejection while returning a successful process status.
+if ! PLAYBACK_OUTPUT=$(asterisk -rx "rpt localplay $NODE $TARGET_BASE" 2>&1); then
+    printf '%s\n' "$PLAYBACK_OUTPUT" >&2
+    fail "Asterisk playback command failed."
+fi
+printf '%s\n' "$PLAYBACK_OUTPUT"
+if [[ "$PLAYBACK_OUTPUT" =~ [Nn]o\ such\ command|[Nn]ode.*not\ found|[Uu]nknown\ node|[Ii]nvalid\ node|[Uu]nable|[Ff]ailed|[Ee]rror|[Uu]sage: ]]; then
+    fail "Asterisk rejected the playback command."
+fi
+FILE_BYTES=$(wc -c < "$TARGET_FILE") || fail "Cannot determine audio length."
+CLEANUP_DELAY=$(( (FILE_BYTES + 7999) / 8000 + PLAYBACK_GRACE ))
+# Stay in the foreground so service managers do not orphan/kill a cleanup child.
+sleep "$CLEANUP_DELAY" || fail "Playback retention wait interrupted."

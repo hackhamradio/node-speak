@@ -1,0 +1,29 @@
+# Python test artifacts and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# OS and editor artifacts
+.DS_Store
+._*
+*~
+*.swp
+*.swo
+
+# Downloaded models and generated audio/logs
+*.onnx
+*.onnx.json
+*.ulaw
+*.wav
+*.log
