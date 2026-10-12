@@ -29,7 +29,6 @@ sudo apt-get update
 sudo apt-get install -y python3 sox util-linux
 ```
 
-
 ## Install
 
 Download the script to your ASL3 host:
@@ -55,7 +54,7 @@ sudo bash ./node-speak --setup
 Setup performs these operations:
 
 1. Installs `asl3-tts` if needed.
-2. Mounts a 32 MiB tmpfs at `/var/lib/asterisk/sounds/ramdisk`, with the Asterisk
+2. Mounts a 32 MiB tmpfs at `/var/lib/asterisk/sounds/node-speak`, with the Asterisk
    account's UID and primary GID and directory mode `0775`.
 3. Adds or updates the exact tmpfs entry in `/etc/fstab`. Changed content is
    backed up to `/etc/fstab.node-speak.bak`.
@@ -140,7 +139,7 @@ Edit the configuration at the top of the downloaded script, then rerun setup.
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `VOICE` | `/var/lib/piper-tts/en_US-amy-low.onnx` | Piper model bundled with `asl3-tts` |
-| `RAMDIR` | `/var/lib/asterisk/sounds/ramdisk` | Mounted tmpfs for generated audio |
+| `RAMDIR` | `/var/lib/asterisk/sounds/node-speak` | Mounted tmpfs for generated audio |
 | `RAMDISK_SIZE` | `32M` | Size used when mounting tmpfs; persisted in fstab |
 | `PLAYBACK_GRACE` | `30` | Extra seconds audio remains available after its estimated duration |
 | `QUEUE_LIMIT` | `64` | Maximum waiting jobs, excluding the active job |
@@ -214,7 +213,7 @@ sudo journalctl -u node-speak.service -f
 | Queue not installed/running | Run setup, then inspect service status and the journal. |
 | Cannot install `asl3-tts` | Check network connectivity and the configured ASL3 package repository. |
 | Missing binary or unreadable model | Check the worker's `PATH`, `VOICE`, and Asterisk's read permissions. |
-| tmpfs verification failure | Run setup as root; inspect `findmnt -M /var/lib/asterisk/sounds/ramdisk`. |
+| tmpfs verification failure | Run setup as root; inspect `findmnt -M /var/lib/asterisk/sounds/node-speak`. |
 | Submission permission denied | Submit as root or Asterisk; inspect ownership of `/run/node-speak`. |
 | Queue full | Allow waiting jobs to finish or adjust `QUEUE_LIMIT` and rerun setup. |
 | Queued successfully, but no audio | Inspect the journal and verify the local node is configured and ready. Submission success does not confirm transmission. |

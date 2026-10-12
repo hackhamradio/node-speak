@@ -3,7 +3,7 @@ set -o pipefail
 
 # Amy low is the model bundled by ASL3's asl3-tts package.
 VOICE="/var/lib/piper-tts/en_US-amy-low.onnx"
-RAMDIR="/var/lib/asterisk/sounds/ramdisk"
+RAMDIR="/var/lib/asterisk/sounds/node-speak"
 RAMDISK_SIZE="32M"
 FSTAB="/etc/fstab"
 INSTALL_PATH="/usr/local/bin/node-speak"

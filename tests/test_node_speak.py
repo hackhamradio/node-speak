@@ -36,7 +36,7 @@ class ScriptTests(unittest.TestCase):
         self.script = self.root / 'script'
         self.script.write_text(SOURCE.read_text()
             .replace('/var/lib/piper-tts/en_US-amy-low.onnx', str(voice))
-            .replace('/var/lib/asterisk/sounds/ramdisk', str(self.ram))
+            .replace('/var/lib/asterisk/sounds/node-speak', str(self.ram))
             .replace('/etc/fstab', str(self.fstab))
             .replace('/usr/local/bin/node-speak', str(self.installed))
             .replace('/etc/systemd/system/node-speak.service', str(self.unit))
