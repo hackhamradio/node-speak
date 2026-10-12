@@ -330,6 +330,86 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('Voice model or metadata unreadable', result.stderr)
         self.assertFalse(self.unit.exists())
 
+    def make_audio_directory(self, name, age=7200):
+        path = self.ram / name
+        path.mkdir()
+        (path / 'speech.ulaw').write_bytes(b'audio')
+        timestamp = time.time() - age
+        os.utime(path, (timestamp, timestamp))
+        return path
+
+    def wait_until_removed(self, path):
+        deadline = time.monotonic() + 3
+        while path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(path.exists(), (self.root / 'worker.log').read_text())
+
+    def test_startup_cleanup_preserves_recent_unrelated_files_and_symlinks(self):
+        stale = self.make_audio_directory('tts_123_ABCDEFGH')
+        recent = self.make_audio_directory('tts_123_RECENT12', age=10)
+        unrelated = self.make_audio_directory('other_audio')
+        malformed = self.make_audio_directory('tts_123_wrong_suffix')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep'
+        marker.write_text('preserve me')
+        link = self.ram / 'tts_123_SYMLINK1'
+        link.symlink_to(outside, target_is_directory=True)
+        # A nested symlink must not cause deletion outside the audio directory.
+        (stale / 'nested').symlink_to(outside, target_is_directory=True)
+        timestamp = time.time() - 7200
+        os.utime(stale, (timestamp, timestamp))
+        self.start_worker()
+        self.wait_until_removed(stale)
+        self.assertTrue(recent.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(malformed.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(marker.read_text(), 'preserve me')
+        self.assertIn('Removed stale audio directory', (self.root / 'worker.log').read_text())
+
+    def test_periodic_cleanup_runs_without_restarting_worker(self):
+        self.script.write_text(self.script.read_text().replace(
+            'STALE_CLEANUP_INTERVAL=900', 'STALE_CLEANUP_INTERVAL=1'))
+        self.start_worker()
+        stale = self.make_audio_directory('tts_123_PERIODIC')
+        self.wait_until_removed(stale)
+
+    def test_periodic_cleanup_waits_for_active_job(self):
+        self.script.write_text(self.script.read_text().replace(
+            'STALE_CLEANUP_INTERVAL=900', 'STALE_CLEANUP_INTERVAL=1'))
+        self.start_worker(GATE='1')
+        self.assertEqual(self.run_script(['123', 'hello']).returncode, 0)
+        deadline = time.monotonic() + 3
+        while not list(self.runtime.glob('job-*.running')):
+            if time.monotonic() >= deadline:
+                self.fail('Job did not start')
+            time.sleep(0.02)
+        stale = self.make_audio_directory('tts_123_WAITJOB1')
+        time.sleep(1.3)
+        self.assertTrue(stale.exists())
+        (self.root / 'release').touch()
+        self.wait_until_removed(stale)
+        self.wait_for_order(['hello'])
+
+    def test_cleanup_failure_is_logged_and_worker_continues(self):
+        stale = self.make_audio_directory('tts_123_FAILURE1')
+        self.script.write_text(self.script.read_text().replace(
+            'shutil.rmtree(entry.path)', "raise PermissionError('simulated cleanup denial')"))
+        self.start_worker()
+        self.assertTrue(stale.exists())
+        self.assertIn('simulated cleanup denial', (self.root / 'worker.log').read_text())
+        self.assertEqual(self.run_script(['123', 'hello']).returncode, 0)
+        self.wait_for_order(['hello'])
+
+    def test_cleanup_age_extends_with_job_timeout_and_grace(self):
+        self.script.write_text(self.script.read_text().replace('JOB_TIMEOUT=600', 'JOB_TIMEOUT=4000'))
+        retained = self.make_audio_directory('tts_123_RETAIN12', age=4000)
+        expired = self.make_audio_directory('tts_123_EXPIRED1', age=5000)
+        self.start_worker()
+        self.wait_until_removed(expired)
+        self.assertTrue(retained.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

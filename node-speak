@@ -14,6 +14,9 @@ MAX_TEXT_BYTES=16384
 JOB_TIMEOUT=600
 # Hold audio through short telemetry delays before processing the next job.
 PLAYBACK_GRACE=30
+# Reclaim abandoned audio after crashes, only when the worker is between jobs.
+STALE_AUDIO_AGE=3600
+STALE_CLEANUP_INTERVAL=900
 
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 require_commands() {
@@ -170,23 +173,28 @@ if [[ "${1:-}" != --play ]]; then
     else
         [[ $# -eq 2 && -n "$2" && "$1" =~ ^[0-9]+$ ]] || fail "Usage: $0 <node_number> \"text to speak\"; or $0 --setup"
     fi
-    python3 - "$0" "$RUNDIR" "$QUEUE_LIMIT" "$MAX_TEXT_BYTES" "$JOB_TIMEOUT" "$@" <<'PYQUEUE'
+    python3 - "$0" "$RUNDIR" "$QUEUE_LIMIT" "$MAX_TEXT_BYTES" "$JOB_TIMEOUT" "$RAMDIR" "$STALE_AUDIO_AGE" "$STALE_CLEANUP_INTERVAL" "$PLAYBACK_GRACE" "$@" <<'PYQUEUE'
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 
-script, runtime, limit, text_limit, job_timeout, *args = sys.argv[1:]
+script, runtime, limit, text_limit, job_timeout, audio, stale_age, cleanup_interval, grace, *args = sys.argv[1:]
 script = os.path.realpath(script)
 runtime = Path(runtime)
 limit, text_limit, job_timeout = map(int, (limit, text_limit, job_timeout))
+stale_age, cleanup_interval, grace = map(int, (stale_age, cleanup_interval, grace))
+# Allow five extra minutes beyond the job timeout and playback grace.
+effective_stale_age = max(stale_age, job_timeout + grace + 300)
 
 
 def log(message):
@@ -237,7 +245,33 @@ def publish(path, content):
             os.unlink(temporary)
 
 
+def cleanup_stale_audio():
+    cutoff = time.time() - effective_stale_age
+    try:
+        with os.scandir(audio) as entries:
+            for entry in entries:
+                if not re.fullmatch(r'tts_[0-9]{1,32}_[A-Za-z0-9]{8}', entry.name):
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                    if (not stat.S_ISDIR(metadata.st_mode)
+                            or metadata.st_uid != os.geteuid()
+                            or metadata.st_mtime >= cutoff):
+                        continue
+                    # rmtree removes nested symlinks without following their targets.
+                    shutil.rmtree(entry.path)
+                    log(f'Removed stale audio directory {entry.name}')
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    log(f'Stale audio cleanup failed for {entry.name}: {error}')
+    except OSError as error:
+        log(f'Stale audio cleanup could not scan {audio}: {error}')
+
+
 def worker():
+    if stale_age <= 0 or cleanup_interval <= 0:
+        raise ValueError('Stale audio age and cleanup interval must be positive')
     if not runtime.is_dir():
         raise ValueError('Runtime directory missing; start node-speak.service')
     with open_lock('worker.lock') as lifetime:
@@ -245,12 +279,17 @@ def worker():
             fcntl.flock(lifetime, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError('Another queue worker is already running')
+        cleanup_stale_audio()
+        next_cleanup = time.monotonic() + cleanup_interval
         # Interrupted jobs are not replayed: they might already have transmitted.
         for abandoned in runtime.glob('job-*.running'):
             log(f'Discarding interrupted job {job_label(abandoned)}; transmission status unknown')
             abandoned.unlink()
         log('Queue worker ready')
         while True:
+            if time.monotonic() >= next_cleanup:
+                cleanup_stale_audio()
+                next_cleanup = time.monotonic() + cleanup_interval
             jobs = ready_jobs()
             if not jobs:
                 time.sleep(0.2)

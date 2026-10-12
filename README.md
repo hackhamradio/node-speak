@@ -145,6 +145,8 @@ Edit the configuration at the top of the downloaded script, then rerun setup.
 | `QUEUE_LIMIT` | `64` | Maximum waiting jobs, excluding the active job |
 | `MAX_TEXT_BYTES` | `16384` | Maximum UTF-8 bytes per submission |
 | `JOB_TIMEOUT` | `600` | Maximum seconds per active job, including rendering and retention |
+| `STALE_AUDIO_AGE` | `3600` | Minimum age in seconds for reclaiming abandoned audio directories |
+| `STALE_CLEANUP_INTERVAL` | `900` | Seconds between stale-audio scans, performed between jobs |
 
 The voice requires a matching `.onnx.json` containing a positive integer
 `audio.sample_rate`. The script reads that rate and converts the audio to 8 kHz
@@ -175,8 +177,23 @@ Failed and timed-out jobs are discarded and logged, allowing later jobs to
 continue. Waiting requests survive automatic restarts and `systemctl restart`.
 An active job interrupted during restart is discarded rather than replayed,
 because it may already have transmitted. Stopping the service explicitly or
-rebooting clears the RAM queue. SIGKILL can leave temporary audio on tmpfs until
-it is unmounted or the host reboots.
+rebooting clears the RAM queue.
+
+The worker also reclaims audio directories abandoned by crashes or SIGKILL. It
+scans at startup and every 15 minutes while idle or between jobs, never during
+its active job. Only directories matching the generated `tts_<node>_<suffix>`
+pattern (an eight-character alphanumeric suffix), owned by the worker account,
+and older than one hour
+are removed. Symlink entries and unrelated files/directories are skipped;
+nested symlinks are removed without following their targets. Queue records and
+locks live separately and are unaffected.
+
+The effective minimum age is the greater of `STALE_AUDIO_AGE` and
+`JOB_TIMEOUT + PLAYBACK_GRACE + 300` seconds, providing extra margin for playback
+after an interruption. Removals and cleanup errors appear in the journal.
+Cleanup failures do not stop the worker. A scan due during a job waits until
+that job finishes. Audio the worker cannot remove remains until manually
+removed or the tmpfs is unmounted/rebooted.
 
 Asterisk's CLI does not confirm playback completion and can silently ignore
 `localplay` for a missing or unready node. FIFO guarantees this worker's command
@@ -230,7 +247,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 Tests use real queue files and advisory locks while mocking package management,
 Linux mounts, Piper, SoX, Asterisk, and systemd installation. They cover FIFO
 submission, prompt return, queue limits, failures, timeouts, recovery, cleanup,
-permissions, and setup. Live service startup, cross-account permissions, audio,
+permissions, stale-audio cleanup, and setup. Live service startup, cross-account permissions, audio,
 and radio playback need verification on the target ASL3 host.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contributions and
