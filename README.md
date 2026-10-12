@@ -29,9 +29,6 @@ sudo apt-get update
 sudo apt-get install -y python3 sox util-linux
 ```
 
-macOS can be used to edit the source and run isolated tests, but deployment
-requires Linux. Invoke this script with Bash; `sh` is not compatible with its
-Bash-specific syntax.
 
 ## Install
 
